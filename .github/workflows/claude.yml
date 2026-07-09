@@ -1,0 +1,212 @@
+name: Claude Code (reusable)
+
+# Central, org-wide Claude Code workflow.
+# Called by a thin caller workflow in each repo via:
+#
+#   jobs:
+#     claude:
+#       uses: viber404202/claude-workflows/.github/workflows/claude.yml@main
+#       secrets: inherit
+#
+# The triggering event's context (comment body, actor, PR, etc.) is available
+# here automatically, so all `if:` conditions and dynamic secret resolution
+# work exactly as they did in a per-repo workflow.
+
+on:
+  workflow_call:
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+
+      - name: Resolve developer token secret name
+        id: resolve
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+          echo "secret_name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure developer token exists
+        env:
+          DEV_TOKEN: ${{ secrets[steps.resolve.outputs.secret_name] }}
+        run: |
+          if [ -z "$DEV_TOKEN" ]; then
+            echo "::error::No Claude token found for '${{ github.actor }}'." \
+              "Add a repository secret named '${{ steps.resolve.outputs.secret_name }}'" \
+              "with a long-lived token (https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            exit 1
+          fi
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1.0.66
+        with:
+          claude_code_oauth_token: ${{ secrets[steps.resolve.outputs.secret_name] }}
+
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
+          # prompt: 'Update the pull request description to include a summary of changes.'
+
+          # Optional: Add claude_args to customize behavior and configuration
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          # claude_args: '--allowed-tools Bash(gh pr *)'
+
+  claude-pr-review:
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude review'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Resolve developer token secret name
+        id: resolve
+        env:
+          ACTOR: ${{ github.event.pull_request.user.login || github.actor }}
+        run: |
+          name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+          echo "secret_name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure developer token exists
+        env:
+          DEV_TOKEN: ${{ secrets[steps.resolve.outputs.secret_name] }}
+        run: |
+          if [ -z "$DEV_TOKEN" ]; then
+            echo "::error::No Claude token found for '${{ github.event.pull_request.user.login || github.actor }}'." \
+              "Add a repository secret named '${{ steps.resolve.outputs.secret_name }}'" \
+              "with a long-lived token (https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            exit 1
+          fi
+
+      - name: Prepare Documentation Context
+        id: prepare-context
+        env:
+          # Optional: override the docs discovered for review context.
+          # Space- or newline-separated list of files/globs, relative to repo root.
+          # Leave empty to auto-discover common project documentation.
+          DOCS_PATHS: ${{ vars.CLAUDE_REVIEW_DOCS }}
+          # Cap total context size (KB) so very large docs don't blow up the prompt.
+          MAX_CONTEXT_KB: "256"
+        run: |
+          echo "Building documentation context..."
+
+          # Build the candidate doc list: explicit override, else auto-discovery.
+          declare -a CANDIDATES=()
+          if [ -n "$DOCS_PATHS" ]; then
+            # Expand user-provided paths/globs.
+            for pattern in $DOCS_PATHS; do
+              for f in $pattern; do
+                [ -f "$f" ] && CANDIDATES+=("$f")
+              done
+            done
+          else
+            # Auto-discover common documentation, plus any repo-level guidance files
+            # and everything under docs/. Null-delimited to survive spaces in names.
+            while IFS= read -r -d '' f; do
+              CANDIDATES+=("$f")
+            done < <(
+              {
+                for f in README.md README.rst CONTRIBUTING.md ARCHITECTURE.md \
+                         CLAUDE.md AGENTS.md .github/CONTRIBUTING.md; do
+                  [ -f "$f" ] && printf '%s\0' "$f"
+                done
+                find docs -type f \( -name '*.md' -o -name '*.rst' \) -print0 2>/dev/null
+              }
+            )
+          fi
+
+          # Create context file header.
+          cat > claude-docs-context.md << 'EOF'
+          # Documentation Context for PR Review
+
+          The following project documentation is provided as reference. Use it to
+          understand conventions, architecture, and requirements when reviewing.
+          If no docs are listed below, review against general best practices.
+
+          EOF
+
+          # Append each doc, de-duplicated and bounded by MAX_CONTEXT_KB.
+          declare -A SEEN=()
+          max_bytes=$((MAX_CONTEXT_KB * 1024))
+          included=0
+          for doc in "${CANDIDATES[@]}"; do
+            [ -n "${SEEN[$doc]:-}" ] && continue
+            SEEN[$doc]=1
+            current=$(wc -c < claude-docs-context.md)
+            if [ "$current" -ge "$max_bytes" ]; then
+              echo "Reached context size cap (${MAX_CONTEXT_KB}KB); skipping remaining docs." >&2
+              break
+            fi
+            echo "## Documentation: $doc" >> claude-docs-context.md
+            echo "" >> claude-docs-context.md
+            cat "$doc" >> claude-docs-context.md
+            echo -e "\n---\n" >> claude-docs-context.md
+            included=$((included + 1))
+          done
+
+          echo "Documentation context prepared: $included file(s), $(wc -l < claude-docs-context.md) lines."
+
+          # Save the content to a GitHub Actions output for use in next step
+          {
+            echo 'DOCS_CONTEXT<<DOCS_EOF'
+            cat claude-docs-context.md
+            echo DOCS_EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1.0.66
+        with:
+          claude_code_oauth_token: ${{ secrets[steps.resolve.outputs.secret_name] }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+            ${{ steps.prepare-context.outputs.DOCS_CONTEXT }}
+
+            ---
+
+            Please review this pull request. If project documentation is provided
+            above, use it as the reference for conventions and requirements;
+            otherwise review against general best practices for this codebase's
+            language and frameworks. Focus on:
+            - Adherence to the project's documented patterns and conventions
+            - Correctness — potential bugs, edge cases, and regressions
+            - Code quality, readability, and maintainability
+            - Security implications (input validation, authz, secrets, injection)
+            - Performance considerations
+            - Test coverage for the changed behavior
+
+            Review only what the diff changes; do not comment on unrelated code.
+            Provide detailed, actionable feedback using inline comments for
+            specific issues, and a short summary comment for overall assessment.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
