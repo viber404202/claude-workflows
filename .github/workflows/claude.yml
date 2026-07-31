@@ -3,15 +3,30 @@ name: Claude Code (reusable)
 # Central, org-wide Claude Code workflow.
 # Called by a thin caller workflow in each repo — see README.md for the full
 # snippet. The caller resolves each developer's CLAUDE_TOKEN_<USERNAME> secret
-# name and passes the token in explicitly
+# name and passes the token in explicitly.
 #
 # The triggering event's context (comment body, actor, PR, etc.) is available
 # here automatically, so all `if:` conditions work exactly as they did in a
 # per-repo workflow.
 #
-# Model selection: mention `@claude` for the default model, or pick one
-# explicitly with `@claude-opus` or `@claude-haiku`
-# (e.g. "@claude-opus fix this flaky test", "@claude-haiku review").
+# ---------------------------------------------------------------------------
+# What you get when you mention @claude
+# ---------------------------------------------------------------------------
+# A single `dispatch` job parses the mention into exactly ONE mode, and each
+# downstream job is gated on that mode. Modes are mutually exclusive — one
+# mention can never start two Claude runs.
+#
+#   @claude review              → review the PR (docs context + inline comments)
+#   @claude fix <description>   → implement the change and push a commit
+#   @claude ask <question>      → answer only; never edits files
+#   @claude <anything else>     → `ask` (the safe default — nothing is written)
+#
+# Model selection composes with every command:
+#   @claude-opus review         → review with Opus
+#   @claude-haiku fix <desc>    → fix with Haiku
+#
+# Filler words between the mention and the command are ignored, so
+# "@claude please review this" and "@claude can you fix the flaky test" work.
 
 on:
   workflow_call:
@@ -21,6 +36,7 @@ on:
           Controls the automatic PR review that runs on pull_request events.
           Callers pass their own CLAUDE_AUTO_PR_REVIEW repository variable
           here. `false`, `0`, `off`, `no`, or `disabled` (case-insensitive)
+          disables it; anything else leaves it enabled.
         type: string
         required: false
         default: 'true'
@@ -34,167 +50,241 @@ on:
       pr_author_token:
         description: >-
           Long-lived Claude Code token belonging to the pull request author,
-          used by the automatic PR review job.
+          used by the review job.
         required: false
 
 jobs:
-  claude:
-    if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+  # ---------------------------------------------------------------------------
+  # Single source of truth: parse the mention into exactly one mode.
+  # ---------------------------------------------------------------------------
+  dispatch:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      # One of: review | fix | ask | none
+      mode: ${{ steps.parse.outputs.mode }}
+      # The mention that was actually typed (@claude, @claude-opus, @claude-haiku).
+      # The action only responds to comments containing its trigger phrase, so
+      # the matched mention has to be passed through verbatim.
+      mention: ${{ steps.parse.outputs.mention }}
+      # `--model opus` / `--model haiku`, or empty for the default model.
+      model_args: ${{ steps.parse.outputs.model_args }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-
-      # The token itself arrives as the `actor_token` secret from the caller.
-      - name: Resolve developer token secret name
-        id: resolve
+      # Every output below is one of a fixed set of literals chosen by a `case`
+      # statement — no comment text is ever written to $GITHUB_OUTPUT, so a
+      # crafted comment body cannot forge a mode or inject extra outputs.
+      - name: Parse mention into a mode
+        id: parse
         env:
-          ACTOR: ${{ github.actor }}
-        run: |
-          name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
-          echo "secret_name=$name" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve model from mention
-        id: model
-        env:
+          EVENT: ${{ github.event_name }}
+          AUTO_PR_REVIEW: ${{ inputs.auto_pr_review }}
           # The text that carried the @claude mention, per event type.
           TEXT: >-
             ${{ github.event.comment.body ||
                 github.event.review.body ||
                 format('{0} {1}', github.event.issue.title, github.event.issue.body) }}
         run: |
-          text=$(printf '%s' "$TEXT" | tr '[:upper:]' '[:lower:]')
-          model=""
-          trigger="@claude"
-          case "$text" in
-            *@claude-opus*)  model="opus";  trigger="@claude-opus" ;;
-            *@claude-haiku*) model="haiku"; trigger="@claude-haiku" ;;
-          esac
-          # The action only responds when the comment contains its trigger
-          # phrase followed by whitespace/punctuation, so "@claude-opus" does
-          # NOT match the default "@claude" — pass the matched mention along.
-          echo "trigger=$trigger" >> "$GITHUB_OUTPUT"
-          if [ -n "$model" ]; then
-            echo "args=--model $model" >> "$GITHUB_OUTPUT"
-            echo "Model override from mention: $model"
-          else
-            echo "args=" >> "$GITHUB_OUTPUT"
-            echo "No model mention found; using the default model."
+          set -euo pipefail
+
+          emit() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+          # --- pull_request events carry no mention: automatic review only ---
+          if [ "$EVENT" = 'pull_request' ]; then
+            case "$(printf '%s' "$AUTO_PR_REVIEW" | tr '[:upper:]' '[:lower:]')" in
+              false|0|off|no|disabled) mode=none ;;
+              *)                       mode=review ;;
+            esac
+            emit mode "$mode"
+            emit mention ''
+            emit model_args ''
+            echo "pull_request event -> mode=$mode (auto_pr_review='$AUTO_PR_REVIEW')"
+            exit 0
           fi
+
+          lower=$(printf '%s' "$TEXT" | tr -d '\r' | tr '[:upper:]' '[:lower:]')
+
+          # --- Which mention was used? Longest first, so "@claude-opus" is
+          # --- never mis-read as a bare "@claude".
+          mention='' model=''
+          for candidate in '@claude-opus:opus' '@claude-haiku:haiku' '@claude:'; do
+            token=${candidate%%:*}
+            # Require a word boundary either side so "@claudebot" and an
+            # email-style "foo/@claude" do not trigger a run.
+            if [[ "$lower" =~ (^|[^a-z0-9_/-])"$token"([^a-z0-9_-]|$) ]]; then
+              mention=$token
+              model=${candidate#*:}
+              break
+            fi
+          done
+
+          if [ -z "$mention" ]; then
+            emit mode none
+            emit mention ''
+            emit model_args ''
+            echo "No @claude mention found -> mode=none"
+            exit 0
+          fi
+
+          # --- Which command follows the mention? Skip conversational filler
+          # --- so "@claude please review this" still resolves to `review`.
+          rest=${lower#*"$mention"}
+          cmd=''
+          for word in $(printf '%s' "$rest" | tr -c 'a-z0-9' ' '); do
+            case "$word" in
+              please|pls|plz|can|could|would|will|you|kindly|now|also|just|\
+              go|ahead|and|then|hey|hi|ok|okay|lets|let|us) continue ;;
+            esac
+            cmd=$word
+            break
+          done
+
+          case "$cmd" in
+            review|reviews|rereview)     mode=review ;;
+            fix|fixes|implement|apply)   mode=fix ;;
+            ask|explain|question|answer) mode=ask ;;
+            # Bare mention, or a command we don't recognise: answer only.
+            # Writing to the branch always requires typing `fix` explicitly.
+            *)                           mode=ask ;;
+          esac
+
+          emit mode "$mode"
+          emit mention "$mention"
+          if [ -n "$model" ]; then
+            emit model_args "--model $model"
+            echo "mention=$mention command='${cmd:-<none>}' -> mode=$mode model=$model"
+          else
+            emit model_args ''
+            echo "mention=$mention command='${cmd:-<none>}' -> mode=$mode model=<default>"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # ASK — answer only. Read-only at the permission level, so nothing this job
+  # does can reach the branch even if the prompt is subverted.
+  # ---------------------------------------------------------------------------
+  claude-ask:
+    needs: dispatch
+    if: needs.dispatch.outputs.mode == 'ask'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # deliberately read-only: `ask` never commits
+      pull-requests: write # post the answer
+      issues: write # post the answer on issues
+      id-token: write
+      actions: read # let Claude read CI results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Ensure developer token exists
         env:
           DEV_TOKEN: ${{ secrets.actor_token }}
+          ACTOR: ${{ github.actor }}
         run: |
+          set -euo pipefail
           if [ -z "$DEV_TOKEN" ]; then
-            echo "::error::No Claude token found for '${{ github.actor }}'." \
-              "Add a repository secret named '${{ steps.resolve.outputs.secret_name }}'" \
-              "with a long-lived token (https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+            echo "::error::No Claude token found for '$ACTOR'." \
+              "Add a repository secret named '$name' with a long-lived token" \
+              "(https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
             exit 1
           fi
 
-      - name: Run Claude Code
-        id: claude
+      - name: Run Claude Code (ask)
         uses: anthropics/claude-code-action@v1.0.66
         with:
           claude_code_oauth_token: ${{ secrets.actor_token }}
-
-          # The mention that was actually used (@claude, @claude-opus, or
-          # @claude-haiku) — the action ignores comments without it.
-          trigger_phrase: ${{ steps.model.outputs.trigger }}
-
-          # Model picked from the mention (@claude-opus/-haiku); empty
-          # means the action's default model.
-          claude_args: ${{ steps.model.outputs.args }}
-
-          # This is an optional setting that allows Claude to read CI results on PRs
+          trigger_phrase: ${{ needs.dispatch.outputs.mention }}
           additional_permissions: |
             actions: read
+          # Editing tools are blocked outright, and the job has no `contents:
+          # write` to push with — the system prompt just makes the contract
+          # explicit so Claude explains the change instead of attempting it.
+          claude_args: |
+            --disallowedTools "Edit,Write,MultiEdit,NotebookEdit"
+            --append-system-prompt "MODE: ASK. Answer the request in your comment and do not change the repository. Read code, tests, and CI results as needed, but never create, edit, or delete files, and never commit or push. If answering well requires a code change, describe precisely what change is needed and tell the user to re-run with '@claude fix <description>' to have it applied."
+            ${{ needs.dispatch.outputs.model_args }}
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
+  # ---------------------------------------------------------------------------
+  # FIX — implement the requested change and push a commit to the PR branch.
+  # ---------------------------------------------------------------------------
+  claude-fix:
+    needs: dispatch
+    if: needs.dispatch.outputs.mode == 'fix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to commit and push the fix
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+      - name: Ensure developer token exists
+        env:
+          DEV_TOKEN: ${{ secrets.actor_token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEV_TOKEN" ]; then
+            name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+            echo "::error::No Claude token found for '$ACTOR'." \
+              "Add a repository secret named '$name' with a long-lived token" \
+              "(https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            exit 1
+          fi
 
-  claude-pr-review:
-    # Automatic on pull_request events unless the caller passes a falsy
-    # `auto_pr_review` input (its CLAUDE_AUTO_PR_REVIEW variable).
-    if: |
-      (github.event_name == 'pull_request' &&
-        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), inputs.auto_pr_review)) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-        (contains(github.event.comment.body, '@claude review') ||
-         contains(github.event.comment.body, '@claude-opus review') ||
-         contains(github.event.comment.body, '@claude-haiku review')))
+      - name: Run Claude Code (fix)
+        uses: anthropics/claude-code-action@v1.0.66
+        with:
+          claude_code_oauth_token: ${{ secrets.actor_token }}
+          trigger_phrase: ${{ needs.dispatch.outputs.mention }}
+          additional_permissions: |
+            actions: read
+          claude_args: |
+            --append-system-prompt "MODE: FIX. Implement the change the user asked for and commit it to this pull request's branch. Deliver exactly the requested scope: do not refactor surrounding code, add abstractions, or fix unrelated problems you notice — mention those in your comment instead. Follow the conventions already used in the files you touch. Run the project's existing tests or linters for the code you changed if they are available, and report the actual result. When you are done, comment with what you changed and why. If the request is too ambiguous to implement safely, make no commit and ask for the missing detail."
+            ${{ needs.dispatch.outputs.model_args }}
+
+  # ---------------------------------------------------------------------------
+  # REVIEW — the PR reviewer. Runs automatically on pull_request events (unless
+  # the caller disables it) and on demand via `@claude review`.
+  # ---------------------------------------------------------------------------
+  claude-review:
+    needs: dispatch
+    if: needs.dispatch.outputs.mode == 'review'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       id-token: write
+      actions: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # Name only, for the error message below — the token itself arrives as the
-      # `pr_author_token` secret from the caller.
-      - name: Resolve developer token secret name
-        id: resolve
-        env:
-          ACTOR: ${{ github.event.pull_request.user.login || github.actor }}
-        run: |
-          name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
-          echo "secret_name=$name" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve model from mention
-        id: model
-        env:
-          # Only comment-triggered reviews carry a mention; automatic
-          # pull_request-event reviews always use the default model.
-          TEXT: ${{ github.event.comment.body || '' }}
-        run: |
-          text=$(printf '%s' "$TEXT" | tr '[:upper:]' '[:lower:]')
-          model=""
-          case "$text" in
-            *@claude-opus*)  model="opus" ;;
-            *@claude-haiku*) model="haiku" ;;
-          esac
-          if [ -n "$model" ]; then
-            echo "args=--model $model" >> "$GITHUB_OUTPUT"
-            echo "Model override from mention: $model"
-          else
-            echo "args=" >> "$GITHUB_OUTPUT"
-            echo "No model mention found; using the default model."
-          fi
-
+      # Comment-triggered reviews act as the commenter; automatic reviews act
+      # as the PR author. The caller resolves both to `pr_author_token`, which
+      # falls back to github.actor when there is no pull_request payload.
       - name: Ensure developer token exists
         env:
           DEV_TOKEN: ${{ secrets.pr_author_token }}
+          ACTOR: ${{ github.event.pull_request.user.login || github.actor }}
         run: |
+          set -euo pipefail
           if [ -z "$DEV_TOKEN" ]; then
-            echo "::error::No Claude token found for '${{ github.event.pull_request.user.login || github.actor }}'." \
-              "Add a repository secret named '${{ steps.resolve.outputs.secret_name }}'" \
-              "with a long-lived token (https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
+            name="CLAUDE_TOKEN_$(printf '%s' "$ACTOR" | tr '[:lower:]-' '[:upper:]_')"
+            echo "::error::No Claude token found for '$ACTOR'." \
+              "Add a repository secret named '$name' with a long-lived token" \
+              "(https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)."
             exit 1
           fi
 
-      - name: Prepare Documentation Context
+      - name: Prepare documentation context
         id: prepare-context
         env:
           # Optional: override the docs discovered for review context.
@@ -202,8 +292,9 @@ jobs:
           # Leave empty to auto-discover common project documentation.
           DOCS_PATHS: ${{ vars.CLAUDE_REVIEW_DOCS }}
           # Cap total context size (KB) so very large docs don't blow up the prompt.
-          MAX_CONTEXT_KB: "256"
+          MAX_CONTEXT_KB: '256'
         run: |
+          set -euo pipefail
           echo "Building documentation context..."
 
           # Build the candidate doc list: explicit override, else auto-discovery.
@@ -256,20 +347,24 @@ jobs:
             echo "## Documentation: $doc" >> claude-docs-context.md
             echo "" >> claude-docs-context.md
             cat "$doc" >> claude-docs-context.md
-            echo -e "\n---\n" >> claude-docs-context.md
+            printf '\n---\n\n' >> claude-docs-context.md
             included=$((included + 1))
           done
 
           echo "Documentation context prepared: $included file(s), $(wc -l < claude-docs-context.md) lines."
 
-          # Save the content to a GitHub Actions output for use in next step
+          # Save the content to a GitHub Actions output for use in the next step.
+          # The delimiter is randomised because the docs are repo content: a file
+          # containing the literal delimiter must not be able to inject outputs.
+          delim="DOCS_EOF_$(openssl rand -hex 16)"
           {
-            echo 'DOCS_CONTEXT<<DOCS_EOF'
+            echo "DOCS_CONTEXT<<$delim"
             cat claude-docs-context.md
-            echo DOCS_EOF
+            echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: anthropics/claude-code-action@v1.0.66
+      - name: Run Claude Code (review)
+        uses: anthropics/claude-code-action@v1.0.66
         with:
           claude_code_oauth_token: ${{ secrets.pr_author_token }}
           track_progress: true
@@ -296,6 +391,10 @@ jobs:
             Provide detailed, actionable feedback using inline comments for
             specific issues, and a short summary comment for overall assessment.
 
+            This is a review only. Do not modify, commit, or push any files — if a
+            fix is warranted, describe it in a comment and note that the author can
+            run `@claude fix <description>` to have it applied.
+
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
-            ${{ steps.model.outputs.args }}
+            ${{ needs.dispatch.outputs.model_args }}
