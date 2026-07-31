@@ -47,8 +47,7 @@ jobs:
     # Superset of the gates inside the reusable workflow; the called jobs still
     # re-check their own conditions.
     if: |
-      (github.event_name == 'pull_request' &&
-        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), vars.CLAUDE_AUTO_PR_REVIEW)) ||
+      github.event_name == 'pull_request' ||
       contains(github.event.comment.body, '@claude') ||
       contains(github.event.review.body, '@claude') ||
       contains(github.event.issue.body, '@claude') ||
@@ -75,6 +74,11 @@ jobs:
   claude:
     needs: resolve
     uses: <YOUR_ORG>/claude-workflows/.github/workflows/claude.yml@main
+    with:
+      # Repo (or org) variable controlling the automatic PR review. Unset means
+      # enabled; set it to `false` to stop reviews running on every PR. The
+      # reusable workflow interprets the value.
+      auto_pr_review: ${{ vars.CLAUDE_AUTO_PR_REVIEW }}
     permissions:
       contents: read
       pull-requests: write

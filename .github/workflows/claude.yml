@@ -15,6 +15,15 @@ name: Claude Code (reusable)
 
 on:
   workflow_call:
+    inputs:
+      auto_pr_review:
+        description: >-
+          Controls the automatic PR review that runs on pull_request events.
+          Callers pass their own CLAUDE_AUTO_PR_REVIEW repository variable
+          here. `false`, `0`, `off`, `no`, or `disabled` (case-insensitive)
+        type: string
+        required: false
+        default: 'true'
     secrets:
       actor_token:
         description: >-
@@ -124,11 +133,11 @@ jobs:
           # claude_args: '--allowed-tools Bash(gh pr *)'
 
   claude-pr-review:
-    # CLAUDE_AUTO_PR_REVIEW set to false/0/off/no/disabled turns the automatic
-    # review off for that repo. Unset means enabled — the default.
+    # Automatic on pull_request events unless the caller passes a falsy
+    # `auto_pr_review` input (its CLAUDE_AUTO_PR_REVIEW variable).
     if: |
       (github.event_name == 'pull_request' &&
-        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), vars.CLAUDE_AUTO_PR_REVIEW)) ||
+        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), inputs.auto_pr_review)) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
         (contains(github.event.comment.body, '@claude review') ||
          contains(github.event.comment.body, '@claude-opus review') ||
