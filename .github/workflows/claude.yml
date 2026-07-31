@@ -1,16 +1,13 @@
 name: Claude Code (reusable)
 
 # Central, org-wide Claude Code workflow.
-# Called by a thin caller workflow in each repo via:
-#
-#   jobs:
-#     claude:
-#       uses: <YOUR_ORG>/claude-workflows/.github/workflows/claude.yml@main
-#       secrets: inherit
+# Called by a thin caller workflow in each repo — see README.md for the full
+# snippet. The caller resolves each developer's CLAUDE_TOKEN_<USERNAME> secret
+# name and passes the token in explicitly
 #
 # The triggering event's context (comment body, actor, PR, etc.) is available
-# here automatically, so all `if:` conditions and dynamic secret resolution
-# work exactly as they did in a per-repo workflow.
+# here automatically, so all `if:` conditions work exactly as they did in a
+# per-repo workflow.
 #
 # Model selection: mention `@claude` for the default model, or pick one
 # explicitly with `@claude-opus` or `@claude-haiku`
@@ -18,6 +15,18 @@ name: Claude Code (reusable)
 
 on:
   workflow_call:
+    secrets:
+      actor_token:
+        description: >-
+          Long-lived Claude Code token belonging to the user who triggered the
+          run (github.actor). Optional so a missing token produces this
+          workflow's actionable error instead of a caller-side failure.
+        required: false
+      pr_author_token:
+        description: >-
+          Long-lived Claude Code token belonging to the pull request author,
+          used by the automatic PR review job.
+        required: false
 
 jobs:
   claude:
@@ -40,6 +49,7 @@ jobs:
           fetch-depth: 1
 
 
+      # The token itself arrives as the `actor_token` secret from the caller.
       - name: Resolve developer token secret name
         id: resolve
         env:
@@ -78,7 +88,7 @@ jobs:
 
       - name: Ensure developer token exists
         env:
-          DEV_TOKEN: ${{ secrets[steps.resolve.outputs.secret_name] }}
+          DEV_TOKEN: ${{ secrets.actor_token }}
         run: |
           if [ -z "$DEV_TOKEN" ]; then
             echo "::error::No Claude token found for '${{ github.actor }}'." \
@@ -91,7 +101,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1.0.66
         with:
-          claude_code_oauth_token: ${{ secrets[steps.resolve.outputs.secret_name] }}
+          claude_code_oauth_token: ${{ secrets.actor_token }}
 
           # The mention that was actually used (@claude, @claude-opus, or
           # @claude-haiku) — the action ignores comments without it.
@@ -130,6 +140,8 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Name only, for the error message below — the token itself arrives as the
+      # `pr_author_token` secret from the caller.
       - name: Resolve developer token secret name
         id: resolve
         env:
@@ -161,7 +173,7 @@ jobs:
 
       - name: Ensure developer token exists
         env:
-          DEV_TOKEN: ${{ secrets[steps.resolve.outputs.secret_name] }}
+          DEV_TOKEN: ${{ secrets.pr_author_token }}
         run: |
           if [ -z "$DEV_TOKEN" ]; then
             echo "::error::No Claude token found for '${{ github.event.pull_request.user.login || github.actor }}'." \
@@ -247,7 +259,7 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1.0.66
         with:
-          claude_code_oauth_token: ${{ secrets[steps.resolve.outputs.secret_name] }}
+          claude_code_oauth_token: ${{ secrets.pr_author_token }}
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
