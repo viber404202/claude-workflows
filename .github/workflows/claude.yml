@@ -16,6 +16,7 @@ name: Claude Code (reusable)
 # downstream job is gated on that mode. Modes are mutually exclusive — one
 # mention can never start two Claude runs.
 #
+#   @claude                     → reply with the list of available commands
 #   @claude review              → review the PR (docs context + inline comments)
 #   @claude fix <description>   → implement the change and push a commit
 #   @claude ask <question>      → answer only; never edits files
@@ -62,7 +63,7 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     outputs:
-      # One of: review | fix | ask | none
+      # One of: review | fix | ask | help | none
       mode: ${{ steps.parse.outputs.mode }}
       # The mention that was actually typed (@claude, @claude-opus, @claude-haiku).
       # The action only responds to comments containing its trigger phrase, so
@@ -79,6 +80,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           AUTO_PR_REVIEW: ${{ inputs.auto_pr_review }}
+          # Who triggered this run — `Bot` for anything posted by an app.
+          SENDER_TYPE: ${{ github.event.sender.type }}
           # The text that carried the @claude mention, per event type.
           TEXT: >-
             ${{ github.event.comment.body ||
@@ -99,6 +102,19 @@ jobs:
             emit mention ''
             emit model_args ''
             echo "pull_request event -> mode=$mode (auto_pr_review='$AUTO_PR_REVIEW')"
+            exit 0
+          fi
+
+          # --- Never act on a mention posted by an app. Our own comments quote
+          # --- the commands verbatim (the help reply below lists them, and a
+          # --- review summary suggests "@claude fix …"), so without this guard
+          # --- Claude would answer itself. Checked after the pull_request
+          # --- branch above so bot-opened PRs are still reviewed.
+          if [ "$SENDER_TYPE" = 'Bot' ]; then
+            emit mode none
+            emit mention ''
+            emit model_args ''
+            echo "Mention came from a bot sender -> mode=none"
             exit 0
           fi
 
@@ -143,8 +159,12 @@ jobs:
             review|reviews|rereview)     mode=review ;;
             fix|fixes|implement|apply)   mode=fix ;;
             ask|explain|question|answer) mode=ask ;;
-            # Bare mention, or a command we don't recognise: answer only.
-            # Writing to the branch always requires typing `fix` explicitly.
+            # Nothing after the mention but filler: the user is asking what
+            # Claude can do, so reply with the command list instead of burning
+            # a full run on an empty question.
+            '')                          mode=help ;;
+            # A command we don't recognise is a question: answer only. Writing
+            # to the branch always requires typing `fix` explicitly.
             *)                           mode=ask ;;
           esac
 
@@ -157,6 +177,55 @@ jobs:
             emit model_args ''
             echo "mention=$mention command='${cmd:-<none>}' -> mode=$mode model=<default>"
           fi
+
+  # ---------------------------------------------------------------------------
+  # HELP — a bare mention. Posts the command list directly with the GitHub
+  # token; no Claude run, no developer token, nothing to check out.
+  # ---------------------------------------------------------------------------
+  claude-help:
+    needs: dispatch
+    if: needs.dispatch.outputs.mode == 'help'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write # post the reply (PR comments are issue comments too)
+    steps:
+      - name: Post the available commands
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Comment events carry `issue`; review events carry `pull_request`.
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          # One of the three fixed mention literals — echoed back so a
+          # `@claude-opus` mention documents itself with `@claude-opus`.
+          MENTION: ${{ needs.dispatch.outputs.mention }}
+        run: |
+          set -euo pipefail
+
+          # Quoted heredoc: the body is a template, so backticks stay literal.
+          # {{M}} is substituted afterwards rather than expanded by the shell.
+          cat > help.md << 'EOF'
+          **Available commands** — say what you want after the mention:
+
+          | You type | What happens | Can it change code? |
+          | --- | --- | --- |
+          | `{{M}} review` | Reviews the PR against this repo's docs, leaves inline comments plus a summary | No |
+          | `{{M}} fix <description>` | Implements the change and commits it | **Yes** |
+          | `{{M}} ask <question>` | Investigates and answers in a comment | No |
+          | `{{M}} <anything else>` | Treated as `ask` — nothing is written | No |
+
+          Pick a model by extending the mention — this composes with every
+          command: `@claude-opus review`, `@claude-haiku fix <description>`.
+          Plain `@claude` uses the default model.
+
+          Conversational filler is ignored, so `{{M}} please review this` and
+          `{{M}} can you fix the flaky test` both work. Landing a change always
+          requires typing `fix` explicitly.
+          EOF
+
+          sed -i "s/{{M}}/$MENTION/g" help.md
+          gh api "repos/$REPO/issues/$NUMBER/comments" -f "body=$(cat help.md)" --silent
+          echo "Posted the command list to $REPO#$NUMBER"
 
   # ---------------------------------------------------------------------------
   # ASK — answer only. Read-only at the permission level, so nothing this job
