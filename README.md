@@ -39,15 +39,50 @@ on:
     types: [opened, reopened, ready_for_review]
 
 jobs:
+  # Developer tokens are per-person secrets named CLAUDE_TOKEN_<USERNAME>, so the
+  # name is only known at run time. Resolve it here, in the caller, where every
+  # org/repo secret is in scope — then the tokens can be passed explicitly and no
+  # `secrets: inherit` is needed (linters such as ghalint reject it).
+  resolve:
+    # Superset of the gates inside the reusable workflow; the called jobs still
+    # re-check their own conditions.
+    if: |
+      github.event_name == 'pull_request' ||
+      contains(github.event.comment.body, '@claude') ||
+      contains(github.event.review.body, '@claude') ||
+      contains(github.event.issue.body, '@claude') ||
+      contains(github.event.issue.title, '@claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      actor_secret_name: ${{ steps.resolve.outputs.actor_secret_name }}
+      pr_author_secret_name: ${{ steps.resolve.outputs.pr_author_secret_name }}
+    steps:
+      - name: Resolve developer token secret name
+        id: resolve
+        env:
+          ACTOR: ${{ github.actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || github.actor }}
+        run: |
+          secret_name() {
+            printf 'CLAUDE_TOKEN_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+          }
+          echo "actor_secret_name=$(secret_name "$ACTOR")" >> "$GITHUB_OUTPUT"
+          echo "pr_author_secret_name=$(secret_name "$PR_AUTHOR")" >> "$GITHUB_OUTPUT"
+
   claude:
+    needs: resolve
     uses: <YOUR_ORG>/claude-workflows/.github/workflows/claude.yml@main
-    secrets: inherit
     permissions:
       contents: read
       pull-requests: write
       issues: read
       id-token: write
       actions: read
+    secrets:
+      actor_token: ${{ secrets[needs.resolve.outputs.actor_secret_name] }}
+      pr_author_token: ${{ secrets[needs.resolve.outputs.pr_author_secret_name] }}
 ```
 
 ## Choosing a model
@@ -69,6 +104,26 @@ that runs when a PR is opened always uses the default model.
 The workflow passes Claude Code's model *aliases* (`opus`, `haiku`), so each
 always resolves to the current model in that family — nothing to update here
 when new versions ship.
+
+## Documentation context for PR reviews
+
+PR reviews are grounded in your repo's own docs. The **Prepare Documentation
+Context** step gathers them and prepends them to the review prompt, so Claude
+reviews against your documented conventions instead of generic best practices.
+
+By default it picks up `README`, `CONTRIBUTING.md`, `ARCHITECTURE.md`,
+`CLAUDE.md`, `AGENTS.md`, and everything under `docs/`.
+
+To use a specific set instead, add a repo or org **variable**
+`CLAUDE_REVIEW_DOCS` with space- or newline-separated paths or globs:
+
+```
+docs/architecture/*.md
+CONTRIBUTING.md
+```
+
+Context is capped at 256 KB (`MAX_CONTEXT_KB`); extra files are skipped and
+noted in the job log. Applies to the PR reviewer only, not the `@claude` job.
 
 ## Secrets
 
@@ -96,9 +151,11 @@ a developer with the username `jane-doe` needs a secret named
 > exact normalized secret name to create.
 
 Define these once as **organization secrets** (Settings → Secrets and variables
-→ Actions) and grant them to all repos; `secrets: inherit` passes them through
-to this workflow. Managing them at the org level means a developer's token works
-across every repo in the company without per-repo setup.
+→ Actions) and grant them to all repos. The caller's `resolve` job works out
+which secret name applies to the current run and passes that one token to this
+workflow as `actor_token` / `pr_author_token`, so no other secret is exposed to
+it. Managing them at the org level means a developer's token works across every
+repo in the company without per-repo setup.
 
 Generate a token: <https://code.claude.com/docs/en/authentication#generate-a-long-lived-token>
 
