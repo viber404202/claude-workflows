@@ -25,10 +25,11 @@ infers it.
 
 ```
 event  ─→  resolve (caller: which CLAUDE_TOKEN_* secret?)
-             └─→  dispatch  ─→  mode = review | fix | ask | none
+             └─→  dispatch  ─→  mode = review | fix | ask | help | none
                                  ├─ review → claude-review   (read-only)
                                  ├─ fix    → claude-fix      (can commit)
                                  ├─ ask    → claude-ask      (read-only)
+                                 ├─ help   → claude-help     (no Claude run)
                                  └─ none   → nothing runs
 ```
 
@@ -45,10 +46,17 @@ Say what you want after the mention. There are three commands:
 | `@claude fix <description>` | Implements the change and commits it | **Yes** |
 | `@claude ask <question>` | Investigates and answers in a comment | No |
 | `@claude <anything else>` | Treated as `ask` | No |
+| `@claude` on its own | Replies with this command list | No |
 
-**A bare mention never writes anything.** `@claude the auth test is broken` gets
-you an explanation of the cause, not a commit. Landing a change always requires
-typing `fix` explicitly, so nothing surprising appears on your branch.
+**Nothing but a mention gets you the menu.** `@claude` — or `@claude please`,
+or any mention followed only by filler — posts the table above as a comment so
+you can see the options without leaving the PR. No Claude run is started and no
+developer token is needed, so it costs nothing to ask.
+
+**A mention with a question never writes anything.** `@claude the auth test is
+broken` gets you an explanation of the cause, not a commit. Landing a change
+always requires typing `fix` explicitly, so nothing surprising appears on your
+branch.
 
 Conversational filler between the mention and the command is ignored, so all of
 these work as you'd expect:
@@ -87,6 +95,7 @@ another mode's job even if the prompt is subverted by a crafted comment:
 
 | Job | `contents` | Editing tools |
 | --- | --- | --- |
+| `claude-help` | not granted | no Claude run at all |
 | `claude-ask` | `read` | blocked (`--disallowedTools`) |
 | `claude-review` | `read` | not granted |
 | `claude-fix` | `write` | allowed |
@@ -131,10 +140,12 @@ new versions ship.
 | `pull_request` (opened, reopened, ready_for_review) | *n/a* | `review` | `claude-review` | PR **author** |
 | `issue_comment` on a PR | `@claude review` | `review` | `claude-review` | commenter |
 | `issue_comment` on a PR | `@claude fix …` | `fix` | `claude-fix` | commenter |
+| `issue_comment` | `@claude` alone | `help` | `claude-help` | none — uses `GITHUB_TOKEN` |
 | `issue_comment` | anything else with `@claude` | `ask` | `claude-ask` | commenter |
 | `pull_request_review_comment` | `@claude …` | per command | per mode | commenter |
 | `pull_request_review` (submitted) | `@claude …` in the review body | per command | per mode | commenter |
 | `issues` (opened, assigned) | `@claude` in title or body | per command | per mode | actor |
+| any | mention posted by a **bot** | `none` | *nothing runs* | — |
 | any | no `@claude` mention | `none` | *nothing runs* | — |
 
 Notes on the token column:
@@ -146,6 +157,11 @@ Notes on the token column:
   PR-open bills to the PR author.
 - When `CLAUDE_AUTO_PR_REVIEW` is disabled, a `pull_request` event resolves to
   `none`: `dispatch` still runs and logs the decision, but no Claude job does.
+- Mentions written by an app (`sender.type == 'Bot'`) resolve to `none`, so the
+  workflow can never answer its own comments — the `help` reply quotes every
+  command, and a review summary suggests `@claude fix …`. The check sits after
+  the `pull_request` branch, so PRs opened by bots such as Dependabot are still
+  reviewed automatically.
 
 ## Add Claude to a new repo
 
