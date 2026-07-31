@@ -124,8 +124,11 @@ jobs:
           # claude_args: '--allowed-tools Bash(gh pr *)'
 
   claude-pr-review:
+    # CLAUDE_AUTO_PR_REVIEW set to false/0/off/no/disabled turns the automatic
+    # review off for that repo. Unset means enabled — the default.
     if: |
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), vars.CLAUDE_AUTO_PR_REVIEW)) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
         (contains(github.event.comment.body, '@claude review') ||
          contains(github.event.comment.body, '@claude-opus review') ||

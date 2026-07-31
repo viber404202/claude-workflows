@@ -47,7 +47,8 @@ jobs:
     # Superset of the gates inside the reusable workflow; the called jobs still
     # re-check their own conditions.
     if: |
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+        !contains(fromJSON('["false", "0", "off", "no", "disabled"]'), vars.CLAUDE_AUTO_PR_REVIEW)) ||
       contains(github.event.comment.body, '@claude') ||
       contains(github.event.review.body, '@claude') ||
       contains(github.event.issue.body, '@claude') ||
@@ -104,6 +105,24 @@ that runs when a PR is opened always uses the default model.
 The workflow passes Claude Code's model *aliases* (`opus`, `haiku`), so each
 always resolves to the current model in that family — nothing to update here
 when new versions ship.
+
+## Turning the automatic PR review on or off
+
+The `claude-pr-review` job runs **automatically** whenever a PR is opened,
+reopened, or marked ready for review. That is the default and needs no
+configuration.
+
+To stop it running automatically in a repo, add a repository **variable**
+(Settings → Secrets and variables → Actions → *Variables*):
+
+| Variable | Value | Effect |
+| --- | --- | --- |
+| `CLAUDE_AUTO_PR_REVIEW` | *unset* | Automatic review runs (default) |
+| `CLAUDE_AUTO_PR_REVIEW` | `false` | Automatic review is skipped |
+
+`0`, `off`, `no`, and `disabled` work as well, and the match is
+case-insensitive. Any other value — including an empty one — leaves the
+automatic review enabled, so a typo fails safe towards reviewing.
 
 ## Documentation context for PR reviews
 
