@@ -188,7 +188,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      issues: write # post the reply (PR comments are issue comments too)
+      issues: write
+      pull-requests: write
     steps:
       - name: Post the available commands
         env:
