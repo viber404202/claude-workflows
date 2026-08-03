@@ -1,15 +1,17 @@
-# claude-workflows
+# dp-claude-workflows
 
-A central, reusable [Claude Code](https://code.claude.com) GitHub Actions
-workflow for your organization. Maintain the automation here once; every repo
-across the company consumes it through a thin caller.
+The central, reusable [Claude Code](https://code.claude.com) GitHub Actions
+workflow for our engineering repos. The automation is maintained here once; repos
+across all of our GitHub organizations consume it through a thin caller.
 
 You get an automatic PR reviewer, plus an on-demand `@claude` responder where
 **you say what you want** — `review`, `fix`, or `ask` — instead of hoping Claude
 infers it.
 
-> **Before you start:** replace `<YOUR_ORG>` in the examples below with your
-> GitHub organization name (the org that owns this `claude-workflows` repo).
+> **Before you start:** in the examples below, replace `<ORG>` with the GitHub
+> organization that owns *this* repo — not the org of the repo you are adding the
+> caller to. A repo in any of our organizations can call this workflow, as long as
+> Actions access is enabled for it (see [Cross-organization use](#cross-organization-use)).
 
 ## How it works
 
@@ -165,8 +167,9 @@ Notes on the token column:
 
 ## Add Claude to a new repo
 
-Create `.github/workflows/claude.yml` in the target repo, replacing `<YOUR_ORG>`
-with your organization name:
+Create `.github/workflows/claude.yml` in the target repo, replacing `<ORG>` with
+the organization that owns this repo. Everything else is copied as-is — the caller
+is identical in every repo:
 
 ```yaml
 name: Claude Code
@@ -218,7 +221,7 @@ jobs:
 
   claude:
     needs: resolve
-    uses: <YOUR_ORG>/claude-workflows/.github/workflows/claude.yml@main
+    uses: <ORG>/dp-claude-workflows/.github/workflows/claude.yml@main
     with:
       # Repo (or org) variable controlling the automatic PR review. Unset means
       # enabled; set it to `false` to stop reviews running on every PR. The
@@ -314,7 +317,12 @@ Actions) and grant them to all repos. The caller's `resolve` job works out which
 secret name applies to the current run and passes that one token to this workflow
 as `actor_token` / `pr_author_token`, so no other secret is exposed to it.
 Managing them at the org level means a developer's token works across every repo
-in the company without per-repo setup.
+in that organization without per-repo setup.
+
+Secrets are **not** shared between GitHub organizations. Because we have several,
+a developer who works in more than one needs their `CLAUDE_TOKEN_<USERNAME>`
+secret defined in each org whose repos they use Claude from — the same token value
+is fine.
 
 Generate a token: <https://code.claude.com/docs/en/authentication#generate-a-long-lived-token>
 
@@ -331,7 +339,6 @@ What this workflow accepts from a caller:
 Both secrets are declared optional on purpose: a missing token then produces this
 workflow's actionable "add a secret named `CLAUDE_TOKEN_…`" error instead of an
 opaque caller-side failure.
-
 
 ## Versioning
 
